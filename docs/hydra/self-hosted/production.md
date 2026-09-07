@@ -32,6 +32,13 @@ Ory Hydra facing the public net directly. We strongly recommend running Ory Hydr
 common to terminate TLS on the edge (gateway / load balancer) and use certificates provided by your infrastructure provider such
 as AWS CA for last mile security.
 
+### Mutual TLS (mTLS) client authentication
+
+Self-hosted Ory Hydra supports the `tls_client_auth` and `self_signed_tls_client_auth` methods from
+[RFC 8705, Section 2](https://www.rfc-editor.org/rfc/rfc8705.html#section-2). A trusted reverse proxy must terminate mTLS and
+forward the client certificate because Ory Hydra doesn't request client certificates on its own TLS listener. Follow the
+[mutual TLS client authentication guide](./mtls-client-authentication.mdx) to configure the proxy, Ory Hydra, and OAuth2 clients.
+
 ### HTTP clients
 
 In some scenarios you might want to disallow HTTP calls to private IP ranges. To configure this feature, set the following

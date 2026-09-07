@@ -6,13 +6,15 @@ sidebar_label: Manage OAuth2 clients
 
 OAuth2 clients are applications that securely authenticate with an authorization server to obtain access to an HTTP service. Every
 OAuth2 client is either confidential or public, depending on whether it can keep a secret. Applications that run on infrastructure
-you control, for example, backends and services, are confidential clients. They authenticate with a client secret. Applications
-distributed to users, for example, single-page apps, mobile, and native apps, are public clients. Anyone can read the code and
-extract an embedded secret, so they authenticate with PKCE and have no secret at all.
+you control, for example, backends and services, are confidential clients. They can authenticate with a client secret or a signed
+JSON Web Token. Self-hosted Ory Hydra can also
+[authenticate them with a client certificate](../self-hosted/mtls-client-authentication.mdx). Applications distributed to users,
+for example, single-page apps, mobile, and native apps, are public clients. Anyone can read the code and extract an embedded
+secret, so they authenticate with PKCE and have no secret at all.
 
-For each of your confidential clients, you register a client record with the client's secret for authentication. Public clients do
-not have a client secret in the registered client record. In Ory, you set whether the client is confidential or public with
-`token_endpoint_auth_method` value, where `none` means public.
+For each of your confidential clients, register a client record with the authentication material required by its
+`token_endpoint_auth_method`. Public clients don't have a client secret in the registered client record and use `none` as their
+`token_endpoint_auth_method`.
 
 This documentation article explains how to manage OAuth2 clients using the Ory Console, Ory SDK, Ory CLI, and Ory REST APIs.
 

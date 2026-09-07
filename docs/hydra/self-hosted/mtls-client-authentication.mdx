@@ -1,0 +1,367 @@
+---
+id: mtls-client-authentication
+title: Mutual TLS client authentication
+---
+
+Self-hosted Ory Hydra supports the `tls_client_auth` and `self_signed_tls_client_auth` methods from
+[RFC 8705, Section 2](https://www.rfc-editor.org/rfc/rfc8705.html#section-2). Ory Hydra doesn't request client certificates on its
+own TLS listener. A trusted reverse proxy must terminate mutual TLS (mTLS) and forward the client certificate to Ory Hydra.
+
+Before enabling mTLS client authentication:
+
+- Configure the reverse proxy to request a client certificate and replace any certificate header supplied by the client.
+- Prevent clients from reaching Ory Hydra without passing through that proxy.
+- Select the matching `oauth2.mtls.certificate_source` preset.
+- Choose whether Ory Hydra or the proxy validates the certificate chain.
+
+## Protect the certificate headers
+
+[RFC 9440, Section 4](https://www.rfc-editor.org/rfc/rfc9440.html#section-4) calls this intermediary a trusted TLS-terminating
+reverse proxy (TTRP) and requires that "backend servers MUST only accept the Client-Cert and Client-Cert-Chain header fields from
+a trusted TTRP." Apply the same rule to every supported proxy header: remove the inbound value at the deployment edge, derive a
+new value from the certificate presented by the TLS peer, and restrict direct access to Ory Hydra. After a certificate source is
+enabled, Ory Hydra authenticates the client with the forwarded certificate as if it had terminated the TLS handshake itself.
+
+## Configure the reverse proxy
+
+The examples in this section configure the reverse proxy. Configure Ory Hydra separately in
+[Configure Ory Hydra](#configure-ory-hydra).
+
+The proxy must request a client certificate without requiring one when the listener also serves clients that use another
+authentication method. With `oauth2.mtls.chain_validation: local`, the proxy forwards the certificate and Ory Hydra validates its
+chain. With `oauth2.mtls.chain_validation: delegated`, the proxy must validate every certificate that it forwards. Require a
+certificate during the TLS handshake only on a listener dedicated to mTLS clients.
+
+Ory Hydra supports these certificate sources:
+
+| `oauth2.mtls.certificate_source` | Expected proxy output                                                                                         |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `rfc9440`                        | RFC 9440 `Client-Cert` and `Client-Cert-Chain` structured fields                                              |
+| `haproxy`                        | Base64-encoded DER in `Client-Cert` and `Client-Cert-Chain`                                                   |
+| `nginx`                          | Percent-encoded PEM in `SSL-Client-Cert`                                                                      |
+| `apache`                         | PEM in `SSL-Client-Cert` and indexed `SSL-Client-Chain-0`, `SSL-Client-Chain-1`, ...                          |
+| `traefik`                        | Comma-separated Base64 DER in `X-Forwarded-Tls-Client-Cert`                                                   |
+| `envoy`                          | One certificate-bearing text-format `X-Forwarded-Client-Cert` element                                         |
+| `custom`                         | A header, encoding, and chain layout defined in the [configuration reference](../reference/configuration.mdx) |
+
+Every preset fixes the certificate encoding and chain layout. You can change the header names of the `haproxy`, `nginx`, and
+`apache` presets. The `rfc9440`, `traefik`, and `envoy` sources reject all generic overrides. Use `custom` to change the wire
+format.
+
+### RFC 9440
+
+Use `oauth2.mtls.certificate_source: rfc9440` when the proxy emits the `Client-Cert` and optional `Client-Cert-Chain` fields
+defined by RFC 9440. This is the preferred interoperable format. Both fields use RFC 8941 byte sequences, not PEM text or
+unwrapped Base64.
+
+### HAProxy
+
+Configure HAProxy to request a certificate and replace the incoming certificate headers:
+
+```haproxy
+bind :443 ssl crt /etc/haproxy/server.pem ca-file /etc/haproxy/client-ca.pem verify optional
+
+http-request del-header Client-Cert
+http-request del-header Client-Cert-Chain
+http-request set-header Client-Cert %[ssl_c_der,base64] if { ssl_c_used }
+http-request set-header Client-Cert-Chain %[ssl_c_chain_der,base64] if { ssl_c_used }
+```
+
+HAProxy always validates a certificate presented under `verify optional`. Use the same accepted certificate authorities in HAProxy
+and Ory Hydra for local validation, or select delegated validation to avoid validating the chain twice.
+
+HAProxy can omit the chain on resumed TLS sessions. With local validation, configure Ory Hydra's `oauth2.mtls.intermediates`
+bundle, disable TLS session resumption, or use delegated validation.
+
+### NGINX
+
+For local validation, request the certificate without requiring NGINX to validate its issuer:
+
+```nginx
+ssl_client_certificate /etc/nginx/client-ca.pem;
+ssl_verify_client optional_no_ca;
+
+proxy_set_header SSL-Client-Cert $ssl_client_escaped_cert;
+```
+
+For delegated validation, use `ssl_verify_client optional` so NGINX validates a certificate when the client presents one. The
+NGINX preset doesn't forward intermediate certificates. Configure Ory Hydra's `oauth2.mtls.intermediates` bundle for local
+validation, or use delegated validation.
+
+### Apache HTTP Server
+
+For local validation, request the certificate without requiring Apache HTTP Server to validate its issuer. Enable certificate
+export and forward the leaf and each intermediate certificate:
+
+```apache
+SSLCACertificateFile /etc/apache2/client-ca.pem
+SSLVerifyClient optional_no_ca
+SSLOptions +StdEnvVars +ExportCertData
+
+RequestHeader set SSL-Client-Cert "%{SSL_CLIENT_CERT}s"
+RequestHeader set SSL-Client-Chain-0 "%{SSL_CLIENT_CERT_CHAIN_0}s"
+RequestHeader set SSL-Client-Chain-1 "%{SSL_CLIENT_CERT_CHAIN_1}s"
+```
+
+For delegated validation, use `SSLVerifyClient optional` so Apache HTTP Server validates a certificate when the client presents
+one. Add contiguous `SSL-Client-Chain-N` headers for longer chains. The first missing header ends the chain.
+
+### Traefik
+
+For local validation, configure a TLS option that requests a client certificate:
+
+```yaml
+tls:
+  options:
+    client-certificate:
+      clientAuth:
+        caFiles:
+          - /etc/traefik/client-ca.pem
+        clientAuthType: RequestClientCert
+```
+
+For delegated validation, use `VerifyClientCertIfGiven`. Remove the incoming header before the `passTLSClientCert` middleware
+writes its value. Without a client certificate, the middleware leaves an incoming header unchanged.
+
+```yaml
+http:
+  middlewares:
+    remove-client-cert:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Tls-Client-Cert: ""
+    forward-client-cert:
+      passTLSClientCert:
+        pem: true
+```
+
+Apply the TLS option and both middlewares to the router, with `remove-client-cert` first, and set
+`oauth2.mtls.certificate_source: traefik` in Ory Hydra.
+
+### Envoy
+
+The following settings apply when you configure Envoy directly. If Istio manages Envoy, follow the [Istio](#istio) instructions
+instead.
+
+For `oauth2.mtls.chain_validation: local`, configure the downstream TLS context to request client certificates and permit Ory
+Hydra to validate their chains:
+
+```yaml
+require_client_certificate: false
+common_tls_context:
+  validation_context:
+    trust_chain_verification: ACCEPT_UNTRUSTED
+```
+
+For `oauth2.mtls.chain_validation: delegated`, configure `trusted_ca` instead:
+
+```yaml
+require_client_certificate: false
+common_tls_context:
+  validation_context:
+    trusted_ca:
+      filename: /etc/envoy/client-ca.pem
+```
+
+At the Envoy proxy that accepts untrusted traffic, use `SANITIZE_SET` so client-supplied `X-Forwarded-Client-Cert` (XFCC) values
+are replaced:
+
+```yaml
+forward_client_cert_details: SANITIZE_SET
+set_current_client_cert_details:
+  cert: true
+```
+
+Enable `set_current_client_cert_details.chain` when Ory Hydra uses local validation and the proxy must forward intermediate
+certificates that aren't configured in Ory Hydra's `oauth2.mtls.intermediates` bundle:
+
+```yaml
+set_current_client_cert_details:
+  cert: true
+  chain: true
+```
+
+The `envoy` source accepts exactly one certificate-bearing text-format XFCC element, written by the proxy that terminated the
+client's TLS. The element must include `Hash` and quoted `Cert` fields. Ory Hydra rejects unknown fields and multi-element
+headers.
+
+### Istio
+
+Istio manages Envoy's downstream TLS context, so don't configure `trust_chain_verification` or `trusted_ca` directly. Istio's
+default XFCC configuration omits the client certificate and is rejected by Ory Hydra.
+
+For direct connections from in-mesh clients:
+
+1. Apply an Istio `PeerAuthentication` resource in `STRICT` mode to the Ory Hydra workload so the sidecar rejects plaintext
+   connections.
+2. Enable certificate details in the proxy headers on the Ory Hydra workload:
+
+   ```yaml title="deployment.yaml"
+   metadata:
+     annotations:
+       proxy.istio.io/config: |
+         proxyHeaders:
+           setCurrentClientCertDetails:
+             cert: true
+   ```
+
+3. Set `oauth2.mtls.certificate_source: envoy` and choose an `oauth2.mtls.chain_validation` mode in Ory Hydra.
+
+Ory Hydra doesn't require `SANITIZE_SET`. For an inbound sidecar, choose `proxyHeaders.forwardedClientCert` based on the proxy's
+position in the request path:
+
+| Mode                  | Use with Ory Hydra                                                                                                                                                          |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `APPEND_FORWARD`      | Works when no earlier XFCC element is present, such as a direct in-mesh connection. Ory Hydra rejects the result if appending creates multiple elements.                    |
+| `SANITIZE_SET`        | Works at a TLS-terminating edge that accepts untrusted traffic because it replaces any incoming XFCC value.                                                                 |
+| `SANITIZE`            | Doesn't work for mTLS client authentication because it removes XFCC without writing the client certificate.                                                                 |
+| `FORWARD_ONLY`        | Use only after a trusted TLS-terminating proxy, and restrict the hop to that proxy's exact principal. It preserves the proxy's element but doesn't create trusted evidence. |
+| `ALWAYS_FORWARD_ONLY` | Don't use. It can preserve a client-supplied XFCC value when the downstream connection isn't mTLS.                                                                          |
+
+On an inbound sidecar, enable `proxyHeaders.setCurrentClientCertDetails.chain` when Ory Hydra uses local validation and the proxy
+must forward intermediate certificates that aren't configured in Ory Hydra's `oauth2.mtls.intermediates` bundle.
+
+For clients that connect through an Istio Gateway:
+
+1. Use `tls.mode: MUTUAL` on a listener dedicated to mTLS clients. Use `OPTIONAL_MUTUAL` when the listener also serves clients
+   that use another authentication method. Configure the client CA as described in Istio's
+   [secure ingress](https://istio.io/latest/docs/tasks/traffic-management/ingress/secure-ingress/) guide.
+2. Keep the gateway's default `SANITIZE_SET` behavior. If you changed that default, set `gatewayTopology.forwardClientCertDetails`
+   to `SANITIZE_SET`. The `proxyHeaders.forwardedClientCert` setting configures inbound sidecars, not gateways.
+3. When the gateway forwards to a sidecar-injected Ory Hydra workload, set the sidecar's
+   `proxyHeaders.forwardedClientCert: FORWARD_ONLY` so it preserves the gateway's single XFCC element.
+4. Apply an Istio `AuthorizationPolicy` that allows requests to Ory Hydra's public port only from the gateway's service-account
+   principal in `source.principals`. Use `<trust-domain>/ns/<namespace>/sa/<service-account>` without a `spiffe://` prefix, for
+   example `cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account`. Scope the rule to the public port with
+   `to.operation.ports`, and retain separate allow rules for callers that require access to the admin port. Without the principal
+   restriction, another workload in the mesh can send a forged XFCC value containing a registered client's public certificate.
+5. With local validation, add every missing intermediate CA certificate to `oauth2.mtls.intermediates` because Istio gateways
+   don't forward the certificate chain. Alternatively, use delegated validation.
+
+## Configure Ory Hydra
+
+`oauth2.mtls.chain_validation` defaults to `local`, which validates `tls_client_auth` certificates in Ory Hydra. Configure
+`oauth2.mtls.trust_anchors` explicitly; Ory Hydra doesn't fall back to the system root pool:
+
+```yaml title="hydra.yml"
+oauth2:
+  mtls:
+    certificate_source: rfc9440
+    chain_validation: local
+    trust_anchors:
+      path: /etc/hydra/client-ca.pem
+    intermediates:
+      path: /etc/hydra/client-intermediates.pem
+```
+
+The `oauth2.mtls.intermediates` bundle is optional when the proxy forwards every intermediate certificate. If the proxy forwards
+only the leaf, add any missing issuing intermediates to this bundle.
+
+Set `oauth2.mtls.chain_validation: delegated` only when the trusted proxy validates the certificate chain:
+
+```yaml title="hydra.yml"
+oauth2:
+  mtls:
+    certificate_source: rfc9440
+    chain_validation: delegated
+```
+
+Delegated validation still requires the proxy to forward the certificate. Ory Hydra derives and matches the registered identifier
+from that certificate. The `self_signed_tls_client_auth` method always matches the presented certificate against the client's
+`x5c` value and doesn't use Ory Hydra's trust-anchor or intermediate pools. When `oauth2.mtls.chain_validation` is `local`,
+however, Ory Hydra requires trust anchors at startup even if all registered clients use `self_signed_tls_client_auth`.
+
+After you set `oauth2.mtls.certificate_source`, Ory Hydra advertises both methods in `token_endpoint_auth_methods_supported`.
+Check the discovery document:
+
+```shell
+curl -s https://hydra.example.com/.well-known/openid-configuration \
+  | jq '.token_endpoint_auth_methods_supported'
+```
+
+## Register clients
+
+### Register a `tls_client_auth` client
+
+Register exactly one certificate identifier for a client that uses `tls_client_auth`. This example matches a URI subject
+alternative name:
+
+```shell
+hydra create client \
+  --endpoint http://127.0.0.1:4445 \
+  --id service-a \
+  --grant-type client_credentials \
+  --scope read \
+  --token-endpoint-auth-method tls_client_auth \
+  --tls-client-auth-san-uri spiffe://example.org/service-a
+```
+
+Choose one of `tls_client_auth_subject_dn`, `tls_client_auth_san_dns`, `tls_client_auth_san_uri`, `tls_client_auth_san_ip`, or
+`tls_client_auth_san_email`.
+
+### Register a `self_signed_tls_client_auth` client
+
+Publish a JSON Web Key Set that contains the client certificate in an `x5c` value:
+
+```json
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "service-a-2026",
+      "n": "<base64url-encoded RSA modulus>",
+      "e": "AQAB",
+      "x5c": ["<base64-encoded DER certificate>"]
+    }
+  ]
+}
+```
+
+The JWK public-key members must describe the public key in the first `x5c` certificate. Ory Hydra compares the DER encoding of the
+presented certificate with that first certificate.
+
+Register the client with the JWKS URI:
+
+```shell
+hydra create client \
+  --endpoint http://127.0.0.1:4445 \
+  --id service-a \
+  --grant-type client_credentials \
+  --scope read \
+  --token-endpoint-auth-method self_signed_tls_client_auth \
+  --jwks-uri https://service-a.example.com/.well-known/jwks.json
+```
+
+:::note
+
+Using the HTTP API, you can also send the JSON Web Key Set as part of the payload (key `jwks`) when creating the client. This is
+not possible using the Ory Hydra CLI.
+
+:::
+
+## Authenticate at the token endpoint
+
+The client presents its certificate during the TLS handshake and must include its `client_id` in the token request. It doesn't
+send a client secret or client assertion:
+
+```shell
+curl --cert client.pem --key client-key.pem \
+  --request POST \
+  --header "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "client_id=service-a" \
+  --data-urlencode "scope=read" \
+  https://hydra.example.com/oauth2/token
+```
+
+In a service mesh, the sidecar can present the workload certificate, so the application sends the same form fields without
+managing a certificate file.
+
+## Limitations
+
+- These methods provide client authentication only. Ory Hydra doesn't implement certificate-bound access tokens or publish
+  `mtls_endpoint_aliases` in discovery.
+- The `envoy` certificate source accepts only one XFCC element and doesn't support multi-hop XFCC chains.
+- One inbound Istio sidecar can't serve both direct in-mesh clients and gateway-forwarded clients. Direct clients require a mode
+  that writes the peer certificate, such as `APPEND_FORWARD` or `SANITIZE_SET`; a gateway path through the sidecar requires
+  `FORWARD_ONLY`. Configure separate entry paths for these topologies.

@@ -211,6 +211,7 @@ const ossSidebar = [
               "hydra/self-hosted/merge-multiple-db-secrets",
               "hydra/self-hosted/secrets-key-rotation",
               "hydra/self-hosted/ssl-https-tls",
+              "hydra/self-hosted/mtls-client-authentication",
               "hydra/guides/cookies",
               "hydra/guides/cors",
               "self-hosted/hydra/debug/csrf",
